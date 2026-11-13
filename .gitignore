@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Stubs gRPC générés par python/generate.py
+python/generated/
