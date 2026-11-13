@@ -1,0 +1,278 @@
+// Contrat entre le backend Python (client) et le service C# (serveur) qui
+// pilote le matériel via NINA.Equipment.
+//
+// Règles de conception :
+//  - Le client ne connaît jamais ASCOM / Alpaca / SDK : seulement ce contrat.
+//  - Aucune image dans les messages : on écrit un FITS sur disque et on renvoie le chemin.
+//  - Erreurs = codes gRPC standard (voir ci-dessous), pas de booléens "ok".
+//
+// Erreurs (status gRPC) :
+//  NOT_FOUND            device_id inconnu
+//  FAILED_PRECONDITION  appareil non connecté, monture parquée, mauvais état
+//  UNIMPLEMENTED        capacité non supportée par cet appareil (voir *Info.can_*)
+//  UNAVAILABLE          appareil déconnecté / câble débranché pendant l'appel
+//  DEADLINE_EXCEEDED    timeout côté appareil
+//  ABORTED              opération interrompue (StopSlew, AbortExposure)
+//  INVALID_ARGUMENT     paramètre hors limites
+//  INTERNAL             erreur driver inattendue (message = détail, à logguer)
+
+syntax = "proto3";
+
+package startracker.devices.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+option csharp_namespace = "StarTracker.Devices.V1";
+
+// ───────────────────────── Types communs ─────────────────────────
+
+enum DeviceKind {
+  DEVICE_KIND_UNSPECIFIED = 0;
+  DEVICE_KIND_MOUNT = 1;
+  DEVICE_KIND_CAMERA = 2;
+}
+
+enum Epoch {
+  EPOCH_UNSPECIFIED = 0;
+  EPOCH_JNOW = 1;
+  EPOCH_J2000 = 2;
+}
+
+message Coordinates {
+  double ra_hours = 1;     // ascension droite, en heures [0, 24)
+  double dec_degrees = 2;  // déclinaison, en degrés [-90, 90]
+  Epoch epoch = 3;
+}
+
+message DeviceRef {
+  string device_id = 1;
+}
+
+message DeviceInfo {
+  string id = 1;           // stable pendant la session, opaque pour le client
+  DeviceKind kind = 2;
+  string name = 3;         // nom lisible (ex. "ZWO ASI294MC Pro")
+  string backend = 4;      // "ascom" | "alpaca" | "sdk:zwo" | "simulator" ...
+  bool connected = 5;
+}
+
+// ───────────────────────── Découverte / connexion ─────────────────────────
+
+message ListDevicesRequest {
+  DeviceKind kind = 1;     // UNSPECIFIED = tous
+  bool rescan = 2;         // true = relancer la détection (USB, réseau Alpaca)
+}
+
+message ListDevicesResponse {
+  repeated DeviceInfo devices = 1;
+}
+
+service DeviceService {
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+  rpc Connect(DeviceRef) returns (DeviceInfo);        // renvoie l'état après connexion
+  rpc Disconnect(DeviceRef) returns (DeviceInfo);
+}
+
+// ───────────────────────── Monture ─────────────────────────
+
+enum PierSide {
+  PIER_SIDE_UNKNOWN = 0;
+  PIER_SIDE_EAST = 1;
+  PIER_SIDE_WEST = 2;
+}
+
+enum GuideDirection {
+  GUIDE_DIRECTION_UNSPECIFIED = 0;
+  GUIDE_DIRECTION_NORTH = 1;
+  GUIDE_DIRECTION_SOUTH = 2;
+  GUIDE_DIRECTION_EAST = 3;
+  GUIDE_DIRECTION_WEST = 4;
+}
+
+enum Axis {
+  AXIS_UNSPECIFIED = 0;
+  AXIS_PRIMARY = 1;    // AD ou azimut
+  AXIS_SECONDARY = 2;  // Dec ou altitude
+}
+
+enum TrackingMode {
+  TRACKING_MODE_UNSPECIFIED = 0;
+  TRACKING_MODE_STOPPED = 1;
+  TRACKING_MODE_SIDEREAL = 2;
+  TRACKING_MODE_LUNAR = 3;
+  TRACKING_MODE_SOLAR = 4;
+  TRACKING_MODE_CUSTOM = 5;   // utilise ra_rate / dec_rate
+}
+
+// Capacités : à lire AVANT d'appeler une méthode optionnelle.
+message MountInfo {
+  DeviceInfo device = 1;
+  bool can_slew = 2;
+  bool can_sync = 3;
+  bool can_park = 4;
+  bool can_pulse_guide = 5;
+  bool can_set_tracking = 6;
+  bool can_set_custom_rate = 7;
+  bool can_move_axis = 8;
+  double guide_rate_ra_arcsec_per_sec = 9;
+  double guide_rate_dec_arcsec_per_sec = 10;
+  double site_latitude_deg = 11;
+  double site_longitude_deg = 12;
+}
+
+message MountState {
+  string device_id = 1;
+  Coordinates coordinates = 2;        // position actuelle pointée
+  double altitude_deg = 3;
+  double azimuth_deg = 4;
+  double sidereal_time_hours = 5;
+  PierSide side_of_pier = 6;
+  bool slewing = 7;
+  bool tracking = 8;
+  TrackingMode tracking_mode = 9;
+  bool parked = 10;
+  bool pulse_guiding = 11;
+  google.protobuf.Timestamp timestamp = 12;   // heure de lecture, côté service
+}
+
+message StreamStateRequest {
+  string device_id = 1;
+  uint32 interval_ms = 2;   // période d'émission ; 0 = défaut (500 ms)
+}
+
+message SlewRequest {
+  string device_id = 1;
+  Coordinates target = 2;
+}
+
+message SlewResult {
+  bool completed = 1;       // false si interrompu (alors le status est ABORTED)
+  MountState final_state = 2;
+}
+
+message SyncRequest {
+  string device_id = 1;
+  Coordinates coordinates = 2;
+}
+
+message SetTrackingRequest {
+  string device_id = 1;
+  TrackingMode mode = 2;
+  // Uniquement pour TRACKING_MODE_CUSTOM, unités ASCOM :
+  //   ra_rate  : secondes d'AD par seconde sidérale
+  //   dec_rate : secondes d'arc par seconde SI
+  // (l'adaptateur ASCOM de NINA transmet ces valeurs à la propriété
+  //  Telescope.RightAscensionRate / DeclinationRate.)
+  double ra_rate = 3;
+  double dec_rate = 4;
+}
+
+message PulseGuideRequest {
+  string device_id = 1;
+  GuideDirection direction = 2;
+  uint32 duration_ms = 3;
+}
+
+message MoveAxisRequest {
+  string device_id = 1;
+  Axis axis = 2;
+  double rate_deg_per_sec = 3;   // 0 = arrêt de l'axe
+}
+
+service MountService {
+  rpc GetInfo(DeviceRef) returns (MountInfo);
+  rpc GetState(DeviceRef) returns (MountState);
+  rpc StreamState(StreamStateRequest) returns (stream MountState);
+
+  // Bloque jusqu'à la fin du pointage. Mettre un deadline côté client.
+  rpc SlewToCoordinates(SlewRequest) returns (SlewResult);
+  rpc StopSlew(DeviceRef) returns (google.protobuf.Empty);
+  rpc Sync(SyncRequest) returns (google.protobuf.Empty);
+
+  rpc SetTracking(SetTrackingRequest) returns (MountState);
+  rpc PulseGuide(PulseGuideRequest) returns (google.protobuf.Empty);
+  rpc MoveAxis(MoveAxisRequest) returns (google.protobuf.Empty);
+
+  rpc Park(DeviceRef) returns (MountState);
+  rpc Unpark(DeviceRef) returns (MountState);
+}
+
+// ───────────────────────── Caméra ─────────────────────────
+
+message CameraInfo {
+  DeviceInfo device = 1;
+  string sensor_name = 2;
+  uint32 width_px = 3;
+  uint32 height_px = 4;
+  double pixel_size_um_x = 5;
+  double pixel_size_um_y = 6;
+  uint32 bit_depth = 7;
+  int32 gain_min = 8;
+  int32 gain_max = 9;
+  double exposure_min_s = 10;
+  double exposure_max_s = 11;
+  uint32 max_bin = 12;
+  bool can_set_gain = 13;
+  bool can_cool = 14;
+  bool can_subframe = 15;
+}
+
+message CameraSettings {
+  string device_id = 1;
+  optional int32 gain = 2;
+  optional int32 offset = 3;
+  optional uint32 bin_x = 4;
+  optional uint32 bin_y = 5;
+  optional double target_temperature_c = 6;
+  optional bool cooler_on = 7;
+}
+
+message CameraStatus {
+  string device_id = 1;
+  double temperature_c = 2;
+  double cooler_power_percent = 3;
+  bool cooler_on = 4;
+  bool exposing = 5;
+  int32 gain = 6;
+  uint32 bin_x = 7;
+  uint32 bin_y = 8;
+}
+
+message ExposeRequest {
+  string device_id = 1;
+  double exposure_s = 2;
+  string output_dir = 3;      // dossier où écrire le FITS (doit exister)
+  string filename_stem = 4;   // optionnel ; sinon généré (horodatage)
+}
+
+message ExposureProgress {
+  double elapsed_s = 1;
+  double total_s = 2;
+}
+
+message ExposureResult {
+  string fits_path = 1;       // chemin absolu du FITS écrit
+  uint32 width_px = 2;
+  uint32 height_px = 3;
+  uint32 bit_depth = 4;
+  google.protobuf.Timestamp start_time = 5;   // UTC, début de pose
+  double exposure_s = 6;
+  double temperature_c = 7;
+}
+
+// Flux : N messages "progress" puis exactement un "result" (ou une erreur).
+message ExposeEvent {
+  oneof event {
+    ExposureProgress progress = 1;
+    ExposureResult result = 2;
+  }
+}
+
+service CameraService {
+  rpc GetInfo(DeviceRef) returns (CameraInfo);
+  rpc GetStatus(DeviceRef) returns (CameraStatus);
+  rpc SetSettings(CameraSettings) returns (CameraStatus);   // renvoie l'état effectif
+  rpc Expose(ExposeRequest) returns (stream ExposeEvent);
+  rpc AbortExposure(DeviceRef) returns (google.protobuf.Empty);
+}
