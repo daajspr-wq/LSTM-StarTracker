@@ -1,206 +1,49 @@
-#!/usr/bin/env python3
-"""Matching d'étoiles entre images successives.
-
-Fournit des fonctions pour associer les étoiles détectées dans une image
-courante (N) à celles de l'image précédente (N-1), en gérant les cas
-d'apparitions et de disparitions d'étoiles.
-
-Méthode : correspondance par distance euclidienne avec seuillage,
-suivi par association gloutonne optimale.
-"""
-
-from typing import Optional
-
-import numpy as np
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
+import numpy as np 
+from scipy import ndimage as ndi
 
 
-def match_stars(
-    current_stars: "list[tuple[float, float]]",
-    previous_stars: "list[tuple[float, float]]",
-    disappearance_threshold: float = 50.0,
-    appearance_threshold: float = 50.0,
-    keep_top_n: "Optional[int]" = None,
-) -> "tuple[list[tuple[int, int, float]], list[tuple[int, float, float]], list[tuple[int, float, float]]]":
-    """Associe les étoiles entre deux images successives.
-
-    Utilise une correspondance par distance euclidienne pour lier les étoiles
-    présentes dans les deux images. Les étoiles qui n'ont pas de correspondance
-    sont classées comme "disparues" (dans l'image précédente) ou "apparaissantes"
-    (dans l'image actuelle).
-
-    Parameters
-    ----------
-    current_stars
-        Liste de positions (x, y) détectées dans l'image N.
-    previous_stars
-        Liste de positions (x, y) détectées dans l'image N-1.
-    disappearance_threshold
-        Seuil maximal de distance (en pixels) pour considérer qu'une étoile
-        a disparu plutôt que déplacée fortement. Par défaut 50 pixels.
-    appearance_threshold
-        Seuil maximal de distance (en pixels) pour considérer qu'une étoile
-        est nouvelle (apparition) plutôt que déplacée. Par défaut 50 pixels.
-    keep_top_n
-        Nombre d'étoiles les plus précises à conserver depuis l'image
-        précédente. Si None, toutes les étoiles sont considérées. Peut être
-        utilisé pour réduire le bruit en ne gardant que les étoiles les
-        plus stables/précises. Par défaut None.
-
-    Returns
-    -------
-    matches : list[tuple[int, int, float]]
-        Liste de correspondances (idx_current, idx_previous, distance).
-        Les indices sont positionnels dans les listes d'entrée.
-    disappeared : list[tuple[int, float, float]]
-        Liste d'étoiles disparues : (idx_previous, x_prev, y_prev).
-    appeared : list[tuple[int, float, float]]
-        Liste d'étoiles apparentes : (idx_current, x_curr, y_curr).
-
-    Raises
-    ------
-    ValueError
-        Si les listes ne contiennent pas de tuples (x, y) valides.
-    """
-    # Filtrer pour ne garder que le top N étoiles si demandé
-    if keep_top_n is not None and keep_top_n > 0:
-        if len(previous_stars) > keep_top_n:
-            # Trier par "précision" - on utilise la position comme proxy
-            # dans un cas réel, on aurait une valeur de confiance/intensité
-            previous_stars = previous_stars[:keep_top_n]
-        if len(current_stars) > keep_top_n:
-            current_stars = current_stars[:keep_top_n]
-
-    # Construction de la matrice de distances
-    n_current = len(current_stars)
-    n_previous = len(previous_stars)
-
-    if n_current == 0 or n_previous == 0:
-        # Pas de correspondance possible
-        disappeared = [(i, x, y) for i, (x, y) in enumerate(previous_stars)]
-        appeared = [(i, x, y) for i, (x, y) in enumerate(current_stars)]
-        return [], disappeared, appeared
-
-    # Matrice des distances euclidiennes
-    distance_matrix = np.zeros((n_current, n_previous))
-    for i, (cx, cy) in enumerate(current_stars):
-        for j, (px, py) in enumerate(previous_stars):
-            distance_matrix[i, j] = np.hypot(cx - px, cy - py)
-
-    # Association gloutonne : chaque étoile actuelle peut matcher
-    # avec au plus une étoile précédente et vice-versa
-    used_previous = set()
-    matches = []
-
-    # Trier les correspondances par distance (du plus proche au plus lointain)
-    flat_indices = np.argmin(distance_matrix, axis=1)
-    min_distances = distance_matrix[np.arange(n_current), flat_indices]
-    sorted_order = np.argsort(min_distances)
-
-    for idx in sorted_order:
-        j = flat_indices[idx]
-        dist = min_distances[idx]
-
-        # Vérifier que cette étoile précédente n'est pas déjà appariée
-        # et que la distance est dans les seuils acceptables
-        if j not in used_previous and dist <= disappearance_threshold:
-            used_previous.add(j)
-            matches.append((idx, j, float(dist)))
-
-    # Déterminer les étoiles précédentes qui n'ont pas correspondre (disparues)
-    disappeared = []
-    for j in range(n_previous):
-        if j not in used_previous:
-            disappeared.append((j, previous_stars[j][0], previous_stars[j][1]))
-
-    # Déterminer les étoiles actuelles qui n'ont pas correspondre (apparentes)
-    current_matched_indices = {m[0] for m in matches}
-    appeared = []
-    for i in range(n_current):
-        if i not in current_matched_indices:
-            appeared.append((i, current_stars[i][0], current_stars[i][1]))
-
-    return matches, disappeared, appeared
+def estimate_global_shift(pos1, pos2, max_shift=25.0, bin_size=1.0, refine_radius=2.0):
+    """Estime le décalage (dx, dy) pos1 -> pos2 par vote dans l'histogramme des différences."""
+    diffs = (pos2[None, :, :] - pos1[:, None, :]).reshape(-1, 2)
+    diffs = diffs[np.all(np.abs(diffs) < max_shift, axis=1)]
+    edges = np.arange(-max_shift, max_shift + bin_size, bin_size)
+    hist, xe, ye = np.histogram2d(diffs[:, 0], diffs[:, 1], bins=[edges, edges])
+    hist = ndi.gaussian_filter(hist, 1.0)                      # tolère le jitter individuel
+    ix, iy = np.unravel_index(np.argmax(hist), hist.shape)
+    peak = np.array([(xe[ix] + xe[ix + 1]) / 2, (ye[iy] + ye[iy + 1]) / 2])
+    close = np.linalg.norm(diffs - peak, axis=1) < refine_radius
+    return np.median(diffs[close], axis=0)
 
 
-def filter_precise_stars(
-    stars_with_metrics: "list[tuple[float, float, float]]",
-    n: "int" = 20,
-) -> "list[tuple[float, float, float]]":
-    """Sélectionne les N étoiles les plus précises.
+def match_stars(stars_a, stars_b, ref_idx, sigma_pos=1.0, sigma_flux=0.25, gate=3.0):
+    """Apparie les étoiles de deux listes de détections.
+    Retourne (liste de tuples (i, j, score), décalage global estimé).
+    Le premier tuple est la paire de l'étoile de référence (indice ref_idx dans stars_a) ;
+    les autres tuples ne sont pas triés."""
+    pos_a = np.array([[s["x"], s["y"]] for s in stars_a])
+    pos_b = np.array([[s["x"], s["y"]] for s in stars_b])
+    flux_a = np.array([s["flux"] for s in stars_a])
+    flux_b = np.array([s["flux"] for s in stars_b])
 
-    Trie les étoiles par leur "précision" (troisième élément, généralement
-    l'intensité ou une mesure de confiance) et retourne les N meilleures.
+    shift = estimate_global_shift(pos_a, pos_b)
 
-    Parameters
-    ----------
-    stars_with_metrics
-        Liste de tuples (x, y, metric) où metric est une mesure de précision
-        ou de confiance plus élevé = meilleure précision.
-    n
-        Nombre d'étoiles les plus précises à retourner. Par défaut 20.
+    # Coût = distance résiduelle (après décalage) et différence de log-flux, en "sigmas"
+    d_pos = cdist(pos_a + shift, pos_b)
+    d_flux = np.abs(np.log(flux_a[:, None] / flux_b[None, :]))
+    cost = np.sqrt((d_pos / sigma_pos) ** 2 + (d_flux / sigma_flux) ** 2)
 
-    Returns
-    -------
-    list[tuple[float, float, float]]
-        Les N étoiles avec la meilleure métrique de précision.
-    """
-    if n <= 0:
-        return []
+    # Porte : on interdit les paires trop éloignées après correction
+    cost_gated = np.where(d_pos > gate * sigma_pos, 1e6, cost)
+    rows, cols = linear_sum_assignment(cost_gated)
 
-    stars_list = list(stars_with_metrics)
-    # Trier par métrique décroissante (la plus haute précision d'abord)
-    # On inverse pour que la plus haute précision soit en premier
-    stars_list.sort(key=lambda s: s[2], reverse=True)
+    matches = [(int(i), int(j), float(cost[i, j])) for i, j in zip(rows, cols)
+               if cost_gated[i, j] < 1e6]
 
-    return stars_list[:n]
-
-
-if __name__ == "__main__":
-    """Démonstration du module de matching d'étoiles."""
-
-    import numpy as np
-
-    # Simuler des étoiles détectées dans l'image N-1
-    prev_stars = [(10.5, 20.3), (30.2, 45.7), (55.1, 80.2), (90.3, 30.1)]
-
-    # Simuler des étoiles détectées dans l'image N (certaines déplacées, une nouvelle, une partie)
-    curr_stars = [(11.2, 21.1), (31.0, 46.5), (92.5, 31.8), (150.0, 50.0)]  # + une nouvelle
-
-    print("=== Matching d'étoiles entre images ===")
-    print(f"Image N-1 : {len(prev_stars)} étoile(s)")
-    print(f"Image N   : {len(curr_stars)} étoile(s)")
-    print()
-
-    matches, disappeared, appeared = match_stars(
-        curr_stars, prev_stars,
-        disappearance_threshold=10.0,
-        appearance_threshold=10.0,
-        keep_top_n=3  # Ne garder que les 3 étoiles les plus précises
-    )
-
-    print(f"Correspondances (matches) : {len(matches)}")
-    for idx_c, idx_p, dist in matches:
-        print(f"  Image N[{idx_c}] ↔ Image N-1[{idx_p}], distance = {dist:.2f} px")
-
-    print(f"\nDisparues (disappeared) : {len(disappeared)}")
-    for idx_p, x, y in disappeared:
-        print(f"  Image N-1[{idx_p}] disparue : (x={x:.1f}, y={y:.1f})")
-
-    print(f"\nApparues (appeared) : {len(appeared)}")
-    for idx_c, x, y in appeared:
-        print(f"  Image N[{idx_c}] apparue : (x={x:.1f}, y={y:.1f})")
-
-    # Démonstration du filtrage des étoiles les plus précises
-    print("\n=== Filtrage des étoiles les plus précises ===")
-    # Chaque étoile est (x, y, metric) où metric = intensité/confiance
-    stars_with_metrics = [
-        (10.5, 20.3, 0.95),  # très précise
-        (30.2, 45.7, 0.87),  # assez précise
-        (55.1, 80.2, 0.99),  # très précise
-        (90.3, 30.1, 0.62),  # moins précise
-    ]
-
-    top_3 = filter_precise_stars(stars_with_metrics, n=3)
-    print(f"Top 3 étoiles les plus précises :")
-    for x, y, metric in top_3:
-        print(f"  (x={x:.1f}, y={y:.1f}, metric={metric:.2f})")
+    # L'étoile de référence passe en tête de liste, le reste garde son ordre
+    k = next((n for n, m in enumerate(matches) if m[0] == ref_idx), None)
+    if k is None:
+        raise ValueError("L'étoile de référence n'a pas de correspondance dans l'image t+1")
+    matches.insert(0, matches.pop(k))
+    return matches, shift
