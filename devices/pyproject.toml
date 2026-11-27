@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "startracker-devices"
+version = "0.2.0"
+description = "Pilotage de montures et caméras via ASCOM Alpaca pour le projet LSTM-StarTracker"
+requires-python = ">=3.10"
+dependencies = [
+    "alpyca>=3.1,<4",
+    "numpy>=1.26",
+    "astropy>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["startracker_devices"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

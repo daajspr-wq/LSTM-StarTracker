@@ -1,0 +1,6 @@
+# Installation recommandée (depuis ce dossier) :  pip install -e ".[dev]"
+# Équivalent sans installer le paquet :
+alpyca>=3.1,<4
+numpy>=1.26
+astropy>=6.0
+pytest>=8
